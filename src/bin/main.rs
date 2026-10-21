@@ -101,10 +101,34 @@ async fn main(spawner: Spawner) -> ! {
 
     utils::display::render_menu(&mut display, 1);
 
-    let _wifi_controller =
-        esp_radio::wifi::WifiController::new(peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-    let _wifi_interface = esp_radio::wifi::Interface::station();
+    let mut wifi_controller = WifiController::new(peripherals.WIFI, ControllerConfig::default())
+        .expect("create Wi-Fi controller failed");
+
+    let wifi_station = StationConfig::default();
+
+    wifi_controller
+        .set_config(&WifiConfig::Station(wifi_station))
+        .expect("set Wi-Fi config failed");
+
+    // joystick
+    let mut adc_config = AdcConfig::new();
+    let mut joy_x = adc_config.enable_pin(peripherals.GPIO34, Attenuation::_11dB);
+    let mut joy_y = adc_config.enable_pin(peripherals.GPIO35, Attenuation::_11dB);
+    let mut adc1 = Adc::new(peripherals.ADC1, adc_config);
+
+    // buttons
+    let select = Input::new(
+        peripherals.GPIO16,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    let back = Input::new(
+        peripherals.GPIO17,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    let menu = Input::new(
+        peripherals.GPIO13,
+        InputConfig::default().with_pull(Pull::Up),
+    );
 
     // TODO: Spawn some tasks
     let _ = spawner;
