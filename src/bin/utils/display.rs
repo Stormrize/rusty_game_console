@@ -1,3 +1,4 @@
+use embedded_graphics::primitives::PrimitiveStyleBuilder;
 use embedded_graphics::{
     geometry::Point,
     mono_font::{MonoTextStyle, ascii::FONT_6X10},
@@ -6,7 +7,6 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::Text,
 };
-use embedded_graphics::primitives::PrimitiveStyleBuilder;
 
 const MENU_ENTRIES: [&str; 2] = ["Online Chess", "Snake"];
 
@@ -39,7 +39,11 @@ where
         };
 
         // rectangle
-        let primitive_style = PrimitiveStyleBuilder::new().fill_color(fill).stroke_color(stroke).stroke_width(1).build();
+        let primitive_style = PrimitiveStyleBuilder::new()
+            .fill_color(fill)
+            .stroke_color(stroke)
+            .stroke_width(1)
+            .build();
         let _ = Rectangle::new(Point::new(62, y - 18), Size::new(196, 30))
             .into_styled(primitive_style)
             .draw(display);
@@ -51,11 +55,9 @@ where
             normal_style
         };
         if selected_row {
-            let _ = Text::new(">", Point::new(92, y), text_style)
-                .draw(display);
+            let _ = Text::new(">", Point::new(92, y), text_style).draw(display);
         }
-        let _ = Text::new(entry, Point::new(104, y), text_style)
-            .draw(display);
+        let _ = Text::new(entry, Point::new(104, y), text_style).draw(display);
     }
 
     let _ = Text::new("UP/DOWN: move", Point::new(12, 200), hint_style).draw(display);
@@ -66,10 +68,7 @@ where
     let _ = Text::new(network.as_str(), Point::new(12, 234), normal_style).draw(display);
 }
 
-pub fn draw_menu_entry<D>(
-    display: &mut D,
-    selected: usize,
-)
+pub fn draw_menu_entry<D>(display: &mut D, selected: usize)
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -88,7 +87,11 @@ where
             Rgb565::new(12, 26, 30)
         };
 
-        let primitive_style = PrimitiveStyleBuilder::new().fill_color(fill).stroke_color(stroke).stroke_width(1).build();
+        let primitive_style = PrimitiveStyleBuilder::new()
+            .fill_color(fill)
+            .stroke_color(stroke)
+            .stroke_width(1)
+            .build();
         let _ = Rectangle::new(Point::new(62, y - 18), Size::new(196, 30))
             .into_styled(primitive_style)
             .draw(display);
@@ -100,11 +103,9 @@ where
         };
 
         if selected_row {
-            let _ = Text::new(">", Point::new(92, y), text_style)
-                .draw(display);
+            let _ = Text::new(">", Point::new(92, y), text_style).draw(display);
         }
 
-        let _ = Text::new(entry, Point::new(104, y), text_style)
-            .draw(display);
+        let _ = Text::new(entry, Point::new(104, y), text_style).draw(display);
     }
 }

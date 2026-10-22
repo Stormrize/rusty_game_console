@@ -9,8 +9,8 @@
 
 mod utils;
 
-use defmt::{error, info};
 use defmt::export::display;
+use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_println as _;
@@ -98,7 +98,7 @@ async fn main(spawner: Spawner) -> ! {
         Orientation::Landscape,
         DisplaySize240x320,
     )
-        .expect("ILI9341 init failed");
+    .expect("ILI9341 init failed");
 
     utils::display::init_menu(&mut display);
 
