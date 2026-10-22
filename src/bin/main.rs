@@ -10,6 +10,7 @@
 mod utils;
 
 use defmt::{error, info};
+use defmt::export::display;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_println as _;
@@ -73,12 +74,12 @@ async fn main(spawner: Spawner) -> ! {
     let spi = Spi::new(
         peripherals.SPI2,
         Config::default()
-            .with_frequency(Rate::from_mhz(4))
+            .with_frequency(Rate::from_mhz(30))
             .with_mode(Mode::_0),
     )
-        .unwrap()
-        .with_sck(peripherals.GPIO18)
-        .with_mosi(peripherals.GPIO25);
+    .unwrap()
+    .with_sck(peripherals.GPIO18)
+    .with_mosi(peripherals.GPIO25);
 
     let cs = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
 
@@ -99,7 +100,7 @@ async fn main(spawner: Spawner) -> ! {
     )
         .expect("ILI9341 init failed");
 
-    utils::display::render_menu(&mut display, 1);
+    utils::display::init_menu(&mut display);
 
     let mut wifi_controller = WifiController::new(peripherals.WIFI, ControllerConfig::default())
         .expect("create Wi-Fi controller failed");
@@ -130,12 +131,130 @@ async fn main(spawner: Spawner) -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
 
-    // TODO: Spawn some tasks
-    let _ = spawner;
+    // initial settup
+    let mut mode = AppMode::Menu;
+    let mut menu_index = 0usize;
+    let mut cursor = (4usize, 6usize);
+    let mut selected: Option<(usize, usize)> = None;
+    let mut promotion_index = 0usize;
+    let mut prev_up = false;
+    let mut prev_down = false;
+    let mut prev_left = false;
+    let mut prev_right = false;
+    let mut prev_select = false;
+    let mut prev_back = false;
+    let mut prev_menu = false;
+    let mut navigation_repeat_ticks = 0u8;
+    let mut last_revision = u64::MAX;
+    let mut last_menu_index = usize::MAX;
+    let mut last_snake_revision = u32::MAX;
+    let mut last_cursor = (usize::MAX, usize::MAX);
+    let mut last_selected: Option<(usize, usize)> = None;
+    let mut last_message = heapless::String::<48>::new();
+    let mut last_status = heapless::String::<16>::new();
+
+    // debug
+    let mut print_vals = false;
+    let mut prev_x = 0;
+    let mut prev_y = 0;
 
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
-    }
+        // joystick x and y
+        let x = nb::block!(adc1.read_oneshot(&mut joy_x)).unwrap_or(2048);
+        let y = nb::block!(adc1.read_oneshot(&mut joy_y)).unwrap_or(2048);
 
+        if x.abs_diff(prev_x) > 100 {
+            prev_x = x;
+            print_vals = true;
+        }
+
+        if y.abs_diff(prev_y) > 100 {
+            prev_y = y;
+            print_vals = true;
+        }
+
+        if print_vals {
+            print_vals = false;
+            info!("X: {} Y: {}\r\n", x, y);
+        }
+
+        // joystick move threshold
+        let now_up = y < 850;
+        let now_down = y > 3200;
+        let now_left = x < 850;
+        let now_right = x > 3200;
+
+        // buttons
+        let now_select = select.is_low();
+        let now_back = back.is_low();
+        let now_menu = menu.is_low();
+
+        let navigation_edge = (now_up && !prev_up)
+            || (now_down && !prev_down)
+            || (now_left && !prev_left)
+            || (now_right && !prev_right);
+        let navigation_held = now_up || now_down || now_left || now_right;
+        // Menu/chess cursor: move immediately on edge, then repeat every ~225 ms.
+        let move_now = if navigation_edge {
+            navigation_repeat_ticks = 0;
+            true
+        } else if navigation_held {
+            navigation_repeat_ticks = navigation_repeat_ticks.saturating_add(1);
+            if navigation_repeat_ticks >= 5 {
+                navigation_repeat_ticks = 0;
+                true
+            } else {
+                false
+            }
+        } else {
+            navigation_repeat_ticks = 0;
+            false
+        };
+
+        // 13 x 14 y
+        // mode logic
+        match mode {
+            AppMode::Menu => {
+                if move_now {
+                    if now_up {
+                        menu_index = menu_index.saturating_sub(1);
+                    }
+                    if now_down {
+                        menu_index = (menu_index + 1).min(1);
+                    }
+                    if now_select && !prev_select {
+                        selected = None;
+                        if menu_index == 0 {
+                            mode = AppMode::Chess;
+                        } else {
+                            mode = AppMode::Snake;
+                        }
+                    }
+                }
+            }
+            AppMode::Chess => {}
+            AppMode::Snake => {}
+        }
+        prev_up = now_up;
+        prev_down = now_down;
+        prev_left = now_left;
+        prev_right = now_right;
+        prev_select = now_select;
+        prev_back = now_back;
+        prev_menu = now_menu;
+
+        match mode {
+            AppMode::Menu => {
+                if menu_index != last_menu_index {
+                    utils::display::draw_menu_entry(&mut display, menu_index);
+                }
+            }
+            AppMode::Chess => {}
+            AppMode::Snake => {}
+        }
+        last_menu_index = menu_index;
+        last_cursor = cursor;
+        last_selected = selected;
+        //        Timer::after(Duration::from_millis(50)).await;
+    }
 }

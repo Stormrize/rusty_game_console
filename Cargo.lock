@@ -1933,6 +1933,7 @@ dependencies = [
  "esp-rtos",
  "heapless 0.9.3",
  "ili9341",
+ "nb 1.1.0",
  "smoltcp 0.14.0",
  "static_cell",
 ]

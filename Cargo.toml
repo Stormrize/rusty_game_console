@@ -64,6 +64,7 @@ embedded-hal-bus = "0.3.0"
 ili9341 = "0.6.0"
 heapless = "0.9.3"
 embedded-graphics = "0.8.2"
+nb = "1.1.0"
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
