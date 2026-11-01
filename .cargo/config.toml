@@ -5,10 +5,7 @@ include = ["esp-config.toml"]
 runner = "espflash flash --monitor --chip esp32 --log-format defmt"
 
 [build]
-rustflags = [
-  "-C", "link-arg=-nostartfiles",
-  "-Z", "stack-protector=all",
-]
+rustflags = ["-C", "link-arg=-nostartfiles", "-Z", "stack-protector=all"]
 
 target = "xtensa-esp32-none-elf"
 
