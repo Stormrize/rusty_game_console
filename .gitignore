@@ -2,6 +2,7 @@
 debug/
 target/
 assets/
+src/bin/utils/config.rs
 
 # Editor configuration
 .vscode/
