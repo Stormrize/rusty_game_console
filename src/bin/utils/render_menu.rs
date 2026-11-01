@@ -4,13 +4,13 @@ use embedded_graphics::{
     mono_font::{MonoTextStyle, ascii::FONT_6X10},
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::Rectangle,
     text::Text,
 };
 
 const MENU_ENTRIES: [&str; 2] = ["Online Chess", "Snake"];
 
-pub fn init_menu<D>(display: &mut D)
+pub fn init_menu<D>(display: &mut D, network_status: &str)
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -63,15 +63,16 @@ where
     let _ = Text::new("UP/DOWN: move", Point::new(12, 200), hint_style).draw(display);
     let _ = Text::new("SELECT: open", Point::new(12, 214), hint_style).draw(display);
     let mut network = heapless::String::<28>::new();
-    let network_status = "good";
     let _ = core::fmt::Write::write_fmt(&mut network, format_args!("Network: {}", network_status));
     let _ = Text::new(network.as_str(), Point::new(12, 234), normal_style).draw(display);
 }
 
-pub fn draw_menu_entry<D>(display: &mut D, selected: usize)
+pub fn draw_menu_entry<D>(display: &mut D, selected: usize, network_status: &str)
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    let normal_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+
     for (index, entry) in MENU_ENTRIES.into_iter().enumerate() {
         let y = 78 + index as i32 * 42;
         let selected_row = index == selected;
@@ -107,5 +108,9 @@ where
         }
 
         let _ = Text::new(entry, Point::new(104, y), text_style).draw(display);
+        let mut network = heapless::String::<28>::new();
+        let _ =
+            core::fmt::Write::write_fmt(&mut network, format_args!("Network: {}", network_status));
+        let _ = Text::new(network.as_str(), Point::new(12, 234), normal_style).draw(display);
     }
 }
