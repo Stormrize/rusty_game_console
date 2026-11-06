@@ -14,12 +14,9 @@ pub type SharedGame = Mutex<NoopRawMutex, GameState>;
 const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const POLL_PERIOD: Duration = Duration::from_secs(1);
-/// Максимальный размер ответа (заголовки + тело). Больше -> ошибка, а не молчаливая обрезка.
 const RESP_MAX: usize = 1536;
 
-// состояние
-
-/// Состояние связи вместо сравнения строк-сообщений.
+// status
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Link {
     Wifi,
@@ -50,14 +47,10 @@ pub struct GameState {
     pub your_color: String<8>,
     pub status: String<16>,
     pub last_move: String<16>,
-    /// Короткое уведомление (результат хода, ошибка сервера).
     pub message: String<48>,
     pub link: Link,
-    /// Ревизия партии на сервере.
     pub revision: u64,
-    /// Растёт при любом реальном изменении: по нему рендер решает, что перерисовать.
     pub generation: u32,
-    /// Растёт при каждом принятом ходе: отсекает устаревшие ответы poll.
     move_seq: u32,
 }
 
@@ -77,7 +70,7 @@ impl GameState {
         }
     }
 
-    /// Что показывать в поле статуса: статус партии, а если связи нет, то причину.
+    // status for chess ui
     pub fn status_text(&self) -> &str {
         if self.link == Link::Online {
             self.status.as_str()
@@ -86,7 +79,7 @@ impl GameState {
         }
     }
 
-    /// Что показывать в нижней полосе.
+    // one more stastus (message from server)
     pub fn bar_text(&self) -> &str {
         if !self.message.is_empty() {
             self.message.as_str()
@@ -106,6 +99,10 @@ impl GameState {
     pub fn set_link(&mut self, link: Link) {
         if self.link != link {
             self.link = link;
+            // Пока связи нет, текст прошлой ошибки уже не про текущее состояние.
+            if matches!(link, Link::Wifi | Link::Dhcp) {
+                assign(&mut self.message, "");
+            }
             self.bump();
         }
     }
@@ -144,7 +141,7 @@ fn assign<const N: usize>(dst: &mut String<N>, src: &str) -> bool {
     *dst != old
 }
 
-// протокол
+// protokoll
 
 #[derive(Deserialize)]
 struct ServerState {
@@ -208,8 +205,7 @@ impl NetError {
     }
 }
 
-/// Один запрос с общим таймаутом. Ответ разбирается прямо из буфера через `parse`,
-/// без промежуточных копий.
+// http
 async fn http<R>(
     stack: Stack<'static>,
     method: &str,
@@ -234,17 +230,16 @@ async fn exchange<R>(
     let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
 
     let [a, b, c, d] = config::SERVER_IP;
+    let server = Ipv4Address::new(a, b, c, d);
     socket
-        .connect((Ipv4Address::new(a, b, c, d), config::SERVER_PORT))
+        .connect((server, config::SERVER_PORT))
         .await
         .map_err(|_| NetError::Connect)?;
 
-    // HTTP/1.0: сервер не использует chunked и сам закрывает соединение после ответа.
     let mut req = String::<512>::new();
     let ok = write!(
         req,
-        "{method} {path} HTTP/1.0\r\nHost: {}:{}\r\nx-player-token: {}\r\n",
-        config::SERVER_HOST,
+        "{method} {path} HTTP/1.0\r\nHost: {server}:{}\r\nx-player-token: {}\r\nConnection: close\r\n",
         config::SERVER_PORT,
         config::PLAYER_TOKEN
     )
@@ -274,14 +269,12 @@ async fn exchange<R>(
         match socket.read(&mut raw[used..]).await {
             Ok(0) => break,
             Ok(n) => used += n,
-            Err(_) if used > 0 => break, // RST после полного ответа
+            Err(_) if used > 0 => break, // RST after reply
             Err(_) => return Err(NetError::Io),
         }
     }
 
-    // освобождаем слот сокета сразу, а не после FIN-WAIT
     socket.abort();
-    let _ = socket.flush().await;
 
     let text = core::str::from_utf8(&raw[..used]).map_err(|_| NetError::BadResponse)?;
     let (head, body) = text.split_once("\r\n\r\n").ok_or(NetError::BadResponse)?;
@@ -299,16 +292,31 @@ fn game_path(suffix: &str) -> String<96> {
     p
 }
 
-// задачи
+// polling loop to server
 
 pub async fn poll_loop(stack: Stack<'static>, shared: &'static SharedGame) -> ! {
-    shared.lock().await.set_link(Link::Dhcp);
-    stack.wait_config_up().await;
-    shared.lock().await.set_link(Link::Connecting);
-
     let path = game_path("");
+
     loop {
-        let seq = shared.lock().await.move_seq;
+        if !stack.is_link_up() {
+            shared.lock().await.set_link(Link::Wifi);
+            Timer::after(POLL_PERIOD).await;
+            continue;
+        }
+        if !stack.is_config_up() {
+            shared.lock().await.set_link(Link::Dhcp);
+            Timer::after(POLL_PERIOD).await;
+            continue;
+        }
+
+        let seq = {
+            let mut g = shared.lock().await;
+            // IP is there, but no communication with server.
+            if g.link == Link::Dhcp {
+                g.set_link(Link::Connecting);
+            }
+            g.move_seq
+        };
         let result = http(stack, "GET", &path, "", read_reply).await;
 
         {

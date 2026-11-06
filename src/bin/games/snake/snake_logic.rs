@@ -1,5 +1,3 @@
-//! Small allocation-free Snake game for the ILI9341 console.
-
 pub const WIDTH: u8 = 20;
 pub const HEIGHT: u8 = 16;
 const MAX_LEN: usize = 192;

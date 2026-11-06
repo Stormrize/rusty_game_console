@@ -13,7 +13,6 @@ const ORIGIN_X: i32 = 40;
 const ORIGIN_Y: i32 = 24;
 const BG: Rgb565 = Rgb565::new(2, 4, 8);
 
-/// Кэш прошлого кадра для инкрементальной отрисовки.
 pub struct SnakeView {
     needs_init: bool,
     body: heapless::Vec<(i32, i32), 512>, // >= WIDTH*HEIGHT
@@ -33,7 +32,7 @@ impl SnakeView {
         }
     }
 
-    /// Вызывать при входе в режим Snake: следующий кадр будет полной перерисовкой.
+    // triggers a whole rerendering, is trigerred in the beginning
     pub fn invalidate(&mut self) {
         self.needs_init = true;
     }
@@ -89,7 +88,6 @@ where
         view.needs_init = false;
     }
 
-    // --- новое состояние
     let (fx, fy) = game.food();
     let food = (fx as i32, fy as i32);
     let mut new_body: heapless::Vec<(i32, i32), 512> = heapless::Vec::new();
@@ -97,7 +95,6 @@ where
         let _ = new_body.push((x as i32, y as i32));
     }
 
-    // --- стираем то, чего больше нет
     for &(x, y) in view.body.iter() {
         if !new_body.contains(&(x, y)) {
             erase_cell(display, x, y);
@@ -109,7 +106,7 @@ where
         }
     }
 
-    // --- еда (рисуем до тела, чтобы голова перекрыла)
+    // food
     let _ = Circle::new(
         Point::new(ORIGIN_X + food.0 * CELL + 2, ORIGIN_Y + food.1 * CELL + 2),
         8,
@@ -117,7 +114,7 @@ where
     .into_styled(PrimitiveStyle::with_fill(Rgb565::new(31, 12, 8)))
     .draw(display);
 
-    // --- тело
+    // body
     for (i, &(x, y)) in new_body.iter().enumerate() {
         let color = if i == 0 {
             Rgb565::CYAN
@@ -129,7 +126,7 @@ where
             .draw(display);
     }
 
-    // --- текст: с фоном и фиксированной шириной, чтобы затирал старый
+    // score
     let score = game.score() as u32;
     if view.score != Some(score) {
         let style = MonoTextStyleBuilder::new()

@@ -5,12 +5,10 @@
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
     holding buffers for the duration of a data transfer."
 )]
-#![deny(clippy::large_stack_frames)]
 
 mod games;
 mod utils;
 
-use defmt::export::display;
 use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
@@ -28,8 +26,7 @@ use crate::games::{
     },
 };
 use crate::utils::config::*;
-use crate::utils::network::GameState;
-use crate::utils::network::SharedGame;
+use crate::utils::network::{GameState, Link, SharedGame};
 use crate::utils::{network, render_menu};
 use display_interface_spi::SPIInterface;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
@@ -74,7 +71,6 @@ enum AppMode {
     Snake,
 }
 
-static WIFI_INIT: StaticCell<WifiController<'static>> = StaticCell::new();
 static NET_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
 static NET_STACK: StaticCell<Stack<'static>> = StaticCell::new();
 static SHARED_GAME: StaticCell<SharedGame> = StaticCell::new();
@@ -92,7 +88,12 @@ async fn net_task(mut runner: Runner<'static, Interface>) -> ! {
 async fn wifi_watchdog(mut controller: WifiController<'static>) -> ! {
     loop {
         if !controller.is_connected() {
-            let _ = controller.connect_async().await;
+            // Never drop this error: the `DisconnectReason` inside it is the only way to
+            // tell a wrong password apart from a missing / 5 GHz / WPA3-only access point.
+            match controller.connect_async().await {
+                Ok(info) => info!("Wi-Fi connected: channel {}", info.channel),
+                Err(e) => error!("Wi-Fi connect failed: {=?}", e),
+            }
         }
         Timer::after(Duration::from_secs(5)).await;
     }
@@ -149,22 +150,17 @@ async fn main(spawner: Spawner) -> ! {
     // wifi
     let rng = Rng::new();
     let net_seed = rng.random() as u64 | ((rng.random() as u64) << 32);
-    let tls_seed = rng.random() as u64 | ((rng.random() as u64) << 32);
 
     let mut wifi_controller = WifiController::new(peripherals.WIFI, ControllerConfig::default())
         .expect("create Wi-Fi controller failed");
 
-    let wifi_station = StationConfig::default();
-
-    wifi_controller
-        .set_config(&WifiConfig::Station(wifi_station))
-        .expect("set Wi-Fi config failed");
-
     let station_config = WifiConfig::Station(
         StationConfig::default()
-            .with_ssid(WIFI_SSID.try_into().unwrap())
+            .with_ssid(WIFI_SSID.try_into().expect("SSID must be <= 32 bytes"))
             .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
-                WIFI_PASSWORD.try_into().unwrap(),
+                WIFI_PASSWORD
+                    .try_into()
+                    .expect("password must be <= 64 bytes"),
             )),
     );
 
@@ -183,8 +179,11 @@ async fn main(spawner: Spawner) -> ! {
     let shared = SHARED_GAME.init(Mutex::new(GameState::new()));
     let stack = NET_STACK.init(stack);
 
+    // net task
     spawner.spawn(net_task(runner).expect("spawn net task"));
+    // task that tries to connect to internet using ssid and password
     spawner.spawn(wifi_watchdog(wifi_controller).expect("spawn Wi-Fi task"));
+    // task that polls a server
     spawner.spawn(network_poll_task(*stack, shared).expect("spawn network task"));
 
     // joystick
@@ -226,6 +225,8 @@ async fn main(spawner: Spawner) -> ! {
     let mut prev_menu = false;
     let mut navigation_repeat_ticks = 0u8;
     let mut last_revision = u64::MAX;
+    let mut last_generation = u32::MAX;
+    let mut last_link = Link::Wifi;
     let mut last_mode = AppMode::Chess;
     let mut last_menu_index = usize::MAX;
     let mut last_snake_revision = u32::MAX;
@@ -355,7 +356,6 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
             AppMode::Snake => {
-                // Отклонение от центра (ADC 12 бит, центр ~2048).
                 const DEAD: i32 = 1000;
                 let dx = x as i32 - 2048;
                 let dy = y as i32 - 2048;
@@ -375,7 +375,6 @@ async fn main(spawner: Spawner) -> ! {
                     None
                 };
 
-                // Сначала пробуем ось с большим отклонением, потом запасную.
                 let (primary, secondary) = if dx.abs() >= dy.abs() {
                     (horiz, vert)
                 } else {
@@ -419,7 +418,10 @@ async fn main(spawner: Spawner) -> ! {
         prev_menu = now_menu;
 
         let snapshot = shared.lock().await.clone();
-        if last_revision != snapshot.revision
+        // `generation` grows on every change, including link changes that leave the game
+        // revision untouched - without it the link text on screen goes stale.
+        if last_generation != snapshot.generation
+            || last_revision != snapshot.revision
             || last_mode != mode
             || last_menu_index != menu_index
             || (mode == AppMode::Snake && last_snake_revision != snake.revision())
@@ -431,17 +433,17 @@ async fn main(spawner: Spawner) -> ! {
             match mode {
                 AppMode::Menu => {
                     if last_mode != AppMode::Menu {
-                        render_menu::init_menu(&mut display, snapshot.status.as_str());
+                        render_menu::init_menu(&mut display, snapshot.status_text());
                         render_menu::draw_menu_entry(
                             &mut display,
                             menu_index,
-                            snapshot.status.as_str(),
+                            snapshot.status_text(),
                         );
-                    } else if menu_index != last_menu_index {
+                    } else if menu_index != last_menu_index || last_link != snapshot.link {
                         render_menu::draw_menu_entry(
                             &mut display,
                             menu_index,
-                            snapshot.status.as_str(),
+                            snapshot.status_text(),
                         );
                     }
                 }
@@ -459,7 +461,9 @@ async fn main(spawner: Spawner) -> ! {
                     render_snake(&mut display, &snake, &mut snake_view);
                 }
             }
+            last_generation = snapshot.generation;
             last_revision = snapshot.revision;
+            last_link = snapshot.link;
             last_mode = mode;
             last_menu_index = menu_index;
             last_snake_revision = snake.revision();

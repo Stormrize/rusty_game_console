@@ -1,10 +1,9 @@
 use core::fmt::Write as _;
 
 use embedded_graphics::{
-    Drawable,
+    Drawable, Pixel,
     draw_target::DrawTarget,
     geometry::{Point, Size},
-    image::Image,
     mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
     pixelcolor::{Rgb565, RgbColor},
     primitives::{Primitive, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment},
@@ -15,7 +14,7 @@ use tinybmp::Bmp;
 use crate::{games::chess::chess_ui::fen_to_grid, utils::network::GameState};
 
 const CELL: i32 = 24;
-const BOARD_X: i32 = 16; // слева место под цифры рангов
+const BOARD_X: i32 = 16;
 const BOARD_Y: i32 = 12;
 const BOARD_SIZE: u32 = (CELL * 8) as u32; // 192
 const PANEL_X: i32 = 216;
@@ -27,7 +26,7 @@ const FONT_H: u32 = 10;
 
 const BG: Rgb565 = Rgb565::new(2, 4, 8);
 const BAR_BG: Rgb565 = Rgb565::new(4, 9, 13);
-const LIGHT: Rgb565 = Rgb565::new(25, 50, 28);
+const LIGHT: Rgb565 = Rgb565::new(31, 61, 27);
 const DARK: Rgb565 = Rgb565::new(7, 16, 19);
 const MUTED: Rgb565 = Rgb565::new(16, 36, 26);
 const GRID: Rgb565 = Rgb565::new(12, 36, 25);
@@ -83,7 +82,7 @@ impl ChessView {
         }
     }
 
-    /// Вызывать при входе в режим Chess: следующий кадр будет полной перерисовкой.
+    // triggers a whole rerendering, is trigerred in the beginning
     pub fn invalidate(&mut self) {
         self.needs_init = true;
     }
@@ -114,8 +113,6 @@ where
         .draw(d);
 }
 
-/// Текст в поле шириной `width` символов. Хвост поля закрашивается фоном,
-/// так что старая более длинная надпись затирается, при этом без мерцания.
 fn put_text<D>(d: &mut D, text: &str, x: i32, y: i32, width: usize, fg: Rgb565, bg: Rgb565)
 where
     D: DrawTarget<Color = Rgb565>,
@@ -150,7 +147,6 @@ where
 {
     let _ = display.clear(BG);
 
-    // рамка доски: снаружи клеток, 1 px
     frame(
         display,
         Rectangle::new(
@@ -161,7 +157,6 @@ where
         GRID,
     );
 
-    // координаты: файлы a..h снизу, ранги 8..1 слева
     for i in 0..8i32 {
         let (mut f, mut r) = ([0u8; 4], [0u8; 4]);
         let file = (b'a' + i as u8) as char;
@@ -247,17 +242,33 @@ fn draw_square<D>(
 {
     let x = BOARD_X + col as i32 * CELL;
     let y = BOARD_Y + row as i32 * CELL;
-    let base = if (row + col) % 2 == 0 { LIGHT } else { DARK };
+    let base = if (row + col).is_multiple_of(2) {
+        LIGHT
+    } else {
+        DARK
+    };
 
     fill(d, x, y, CELL as u32, CELL as u32, base);
 
     if let Some(i) = piece_index(piece) {
-        // фигура 20x20 со сдвигом 2: по краю клетки остаётся полоса в 2 px под кольца
+        // changes chess figure background color to square background collor
+        // it is needed as tinybmp does not support alpha channel
+        // it is a little bit slow for embdedded, change library
+        let offset = Point::new(x + 2, y + 2);
+
+        let modified_pixels = figures[i].pixels().map(|Pixel(point, color)| {
+            let new_color = if color == Rgb565::WHITE { base } else { color };
+
+            Pixel(point + offset, new_color)
+        });
+
+        let _ = d.draw_iter(modified_pixels);
+
+        #[cfg(false)]
         let _ = Image::new(&figures[i], Point::new(x + 2, y + 2)).draw(d);
     }
 
     match (is_selected, is_cursor) {
-        // курсор на выбранной клетке: снаружи 1 px циан, внутри 1 px выделение
         (true, true) => {
             ring(d, x, y, 0, 1, CURSOR);
             ring(d, x, y, 1, 1, SELECT);
@@ -268,12 +279,12 @@ fn draw_square<D>(
     }
 }
 
-fn draw_panel<D>(d: &mut D, s: &GameState)
+fn draw_panel<D>(d: &mut D, state: &GameState)
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    // чей ход
-    let white = s.turn.as_str() == "white";
+    // whoose turn
+    let white = state.turn.as_str() == "white";
     let _ = Rectangle::new(Point::new(PANEL_X, 34), Size::new(12, 12))
         .into_styled(
             PrimitiveStyleBuilder::new()
@@ -299,10 +310,9 @@ where
         BG,
     );
 
-    // статус игры / состояние связи
     put_text(
         d,
-        s.status_text(),
+        state.status_text(),
         PANEL_X,
         56,
         PANEL_CHARS,
@@ -310,16 +320,14 @@ where
         BG,
     );
 
-    // последний ход
-    let last = s.last_move.as_str();
+    let last = state.last_move.as_str();
     let mut label = heapless::String::<32>::new();
     let _ = write!(label, "Last: {}", if last.is_empty() { "--" } else { last });
     put_text(d, &label, PANEL_X, 74, PANEL_CHARS, Rgb565::WHITE, BG);
 
-    // нижняя полоса
     put_text(
         d,
-        s.bar_text(),
+        state.bar_text(),
         8,
         BAR_Y + 4,
         BAR_CHARS,
@@ -355,8 +363,7 @@ where
     }
 }
 
-// главная функция
-
+// main function to render chess
 pub fn render_chess<D>(
     display: &mut D,
     state: &GameState,
@@ -407,7 +414,7 @@ pub fn render_chess<D>(
     view.cursor = cursor;
     view.selected = selected;
 
-    // панель и нижняя полоса: целиком, но только при смене состояния
+    // status from server or polling loop
     if state_changed {
         draw_panel(display, state);
         view.generation = state.generation;

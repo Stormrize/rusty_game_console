@@ -26,7 +26,7 @@ pub fn fen_to_grid(fen: &str) -> [[u8; 8]; 8] {
     grid
 }
 
-pub fn square_name(file: usize, row: usize) -> ([u8; 2]) {
+pub fn square_name(file: usize, row: usize) -> [u8; 2] {
     [b'a' + file.min(7) as u8, b'8' - row.min(7) as u8]
 }
 
