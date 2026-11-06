@@ -3,6 +3,7 @@ debug/
 target/
 assets/
 src/bin/utils/config.rs
+.idea
 
 # Editor configuration
 .vscode/
