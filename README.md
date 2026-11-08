@@ -3,10 +3,10 @@
 A DIY handheld gaming console powered by **ESP32** and written entirely in **Rust**.
 
 snake
-![Uploading snake.jpg…]()
+<img width="800" height="602" alt="snake" src="https://github.com/user-attachments/assets/4e8eb406-1036-4b60-ba0d-ee84c8cd8637" />
 
 chess
-![Uploading chess.jpg…]()
+<img width="800" height="602" alt="chess" src="https://github.com/user-attachments/assets/c95ba22a-eb0a-4d20-840b-b1bb9e9190a2" />
 
 ## Hardware
 
