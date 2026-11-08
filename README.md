@@ -2,9 +2,11 @@
 
 A DIY handheld gaming console powered by **ESP32** and written entirely in **Rust**.
 
-<p align="center">
-  <img src="/home/stormrize/Pictures/Screenshots/snake.jpg" width="500" alt="Rusty Game Console">
-</p>
+snake
+![Uploading snake.jpg…]()
+
+chess
+![Uploading chess.jpg…]()
 
 ## Hardware
 
