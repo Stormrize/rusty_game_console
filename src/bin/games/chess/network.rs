@@ -1,22 +1,38 @@
 use core::fmt::Write as _;
+use core::sync::atomic::{AtomicBool, Ordering};
 
+use embassy_executor::Spawner;
 use embassy_net::{Ipv4Address, Stack, tcp::TcpSocket};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::Write as _;
 use heapless::String;
 use serde::Deserialize;
+use static_cell::StaticCell;
 
 use crate::utils::config;
 
 pub type SharedGame = Mutex<NoopRawMutex, GameState>;
+pub type SharedSession = Mutex<NoopRawMutex, Session>;
 
-const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+static SHARED_GAME: StaticCell<SharedGame> = StaticCell::new();
+static SHARED_SESSION: StaticCell<SharedSession> = StaticCell::new();
+static NETWORK_SPAWNED: AtomicBool = AtomicBool::new(false);
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const POLL_PERIOD: Duration = Duration::from_secs(1);
 const RESP_MAX: usize = 1536;
 
+/// Initializes the chess shared state and returns shared handles to it. Called
+/// once by the app before any chess game is built or its network task spawns.
+pub fn init_shared() -> (&'static SharedGame, &'static SharedSession) {
+    let game: &'static SharedGame = SHARED_GAME.init(Mutex::new(GameState::new()));
+    let session: &'static SharedSession = SHARED_SESSION.init(Mutex::new(Session::new()));
+    (game, session)
+}
+
 // status
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Link {
     Wifi,
@@ -57,9 +73,9 @@ pub struct GameState {
 impl GameState {
     pub fn new() -> Self {
         Self {
-            fen: String::try_from(START_FEN).unwrap_or_default(),
-            turn: String::try_from("white").unwrap_or_default(),
-            your_color: String::try_from("?").unwrap_or_default(),
+            fen: String::new(),
+            turn: String::new(),
+            your_color: String::new(),
             status: String::new(),
             last_move: String::new(),
             message: String::new(),
@@ -70,7 +86,6 @@ impl GameState {
         }
     }
 
-    // status for chess ui
     pub fn status_text(&self) -> &str {
         if self.link == Link::Online {
             self.status.as_str()
@@ -79,7 +94,6 @@ impl GameState {
         }
     }
 
-    // one more stastus (message from server)
     pub fn bar_text(&self) -> &str {
         if !self.message.is_empty() {
             self.message.as_str()
@@ -99,7 +113,6 @@ impl GameState {
     pub fn set_link(&mut self, link: Link) {
         if self.link != link {
             self.link = link;
-            // Пока связи нет, текст прошлой ошибки уже не про текущее состояние.
             if matches!(link, Link::Wifi | Link::Dhcp) {
                 assign(&mut self.message, "");
             }
@@ -111,14 +124,14 @@ impl GameState {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn apply(&mut self, s: &ServerState) {
+    fn apply_server(&mut self, s: &ServerState) {
         let mut changed = assign(&mut self.fen, &s.fen);
         changed |= assign(&mut self.turn, &s.turn);
         changed |= assign(&mut self.your_color, &s.your_color);
         changed |= assign(&mut self.status, &s.status);
         changed |= assign(&mut self.last_move, s.last_move.as_deref().unwrap_or(""));
         if self.revision != s.revision {
-            // пришёл новый ход, старое уведомление уже неактуально
+            // A new move arrived; a stale notification is no longer relevant.
             self.revision = s.revision;
             assign(&mut self.message, "");
             changed = true;
@@ -129,7 +142,7 @@ impl GameState {
     }
 }
 
-/// Записывает `src` в `dst` (с обрезкой по ёмкости). Возвращает true, если значение изменилось.
+/// Writes `src` into `dst` (truncated to capacity). Returns true on change.
 fn assign<const N: usize>(dst: &mut String<N>, src: &str) -> bool {
     let old = dst.clone();
     dst.clear();
@@ -141,7 +154,38 @@ fn assign<const N: usize>(dst: &mut String<N>, src: &str) -> bool {
     *dst != old
 }
 
-// protokoll
+// session (connection identity, discovered from the server)
+
+pub struct Session {
+    game_id: String<32>,
+    token: String<32>,
+    joined: bool,
+}
+
+impl Session {
+    fn new() -> Self {
+        Self {
+            game_id: String::new(),
+            token: String::new(),
+            joined: false,
+        }
+    }
+
+    fn is_joined(&self) -> bool {
+        self.joined && !self.game_id.is_empty()
+    }
+}
+
+// protocol
+
+#[derive(Deserialize)]
+struct JoinReply {
+    game_id: String<32>,
+    token: String<32>,
+    #[serde(default)]
+    color: String<8>,
+    state: ServerState,
+}
 
 #[derive(Deserialize)]
 struct ServerState {
@@ -160,29 +204,7 @@ struct ApiError<'a> {
     message: &'a str,
 }
 
-enum Reply {
-    State(ServerState),
-    Error(String<48>),
-}
-
-fn read_reply(status: u16, body: &str) -> Result<Reply, NetError> {
-    if status == 200 {
-        serde_json_core::from_str::<ServerState>(body)
-            .map(|(s, _)| Reply::State(s))
-            .map_err(|_| NetError::Json)
-    } else {
-        let msg = serde_json_core::from_str::<ApiError>(body)
-            .map(|(e, _)| e.message)
-            .unwrap_or("HTTP error");
-        let mut out = String::new();
-        assign(&mut out, msg);
-        Ok(Reply::Error(out))
-    }
-}
-
-// HTTP
-
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum NetError {
     Timeout,
     Connect,
@@ -190,10 +212,11 @@ enum NetError {
     BadResponse,
     TooLarge,
     Json,
+    Server(String<48>),
 }
 
 impl NetError {
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             NetError::Timeout => "Network timeout",
             NetError::Connect => "Can't connect",
@@ -201,21 +224,63 @@ impl NetError {
             NetError::BadResponse => "Bad HTTP response",
             NetError::TooLarge => "Response too large",
             NetError::Json => "Invalid server JSON",
+            NetError::Server(_) => "Server error",
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            NetError::Server(m) => m.as_str(),
+            other => other.label(),
         }
     }
 }
 
-// http
+fn server_error(body: &str) -> NetError {
+    let msg = serde_json_core::from_str::<ApiError>(body)
+        .map(|(e, _)| e.message)
+        .unwrap_or("HTTP error");
+    let mut out = String::new();
+    assign(&mut out, msg);
+    NetError::Server(out)
+}
+
+fn read_state(status: u16, body: &str) -> Result<ServerState, NetError> {
+    if status == 200 {
+        serde_json_core::from_str::<ServerState>(body)
+            .map(|(s, _)| s)
+            .map_err(|_| NetError::Json)
+    } else {
+        Err(server_error(body))
+    }
+}
+
+fn read_join(status: u16, body: &str) -> Result<JoinReply, NetError> {
+    if status == 200 || status == 201 {
+        serde_json_core::from_str::<JoinReply>(body)
+            .map(|(j, _)| j)
+            .map_err(|_| NetError::Json)
+    } else {
+        Err(server_error(body))
+    }
+}
+
+// HTTP
+
 async fn http<R>(
     stack: Stack<'static>,
     method: &str,
     path: &str,
     body: &str,
+    token: Option<&str>,
     parse: impl FnOnce(u16, &str) -> Result<R, NetError>,
 ) -> Result<R, NetError> {
-    with_timeout(REQUEST_TIMEOUT, exchange(stack, method, path, body, parse))
-        .await
-        .unwrap_or(Err(NetError::Timeout))
+    with_timeout(
+        REQUEST_TIMEOUT,
+        exchange(stack, method, path, body, token, parse),
+    )
+    .await
+    .unwrap_or(Err(NetError::Timeout))
 }
 
 async fn exchange<R>(
@@ -223,6 +288,7 @@ async fn exchange<R>(
     method: &str,
     path: &str,
     body: &str,
+    token: Option<&str>,
     parse: impl FnOnce(u16, &str) -> Result<R, NetError>,
 ) -> Result<R, NetError> {
     let mut rx = [0u8; 1024];
@@ -237,24 +303,30 @@ async fn exchange<R>(
         .map_err(|_| NetError::Connect)?;
 
     let mut req = String::<512>::new();
-    let ok = write!(
+    let mut ok = write!(
         req,
-        "{method} {path} HTTP/1.0\r\nHost: {server}:{}\r\nx-player-token: {}\r\nConnection: close\r\n",
-        config::SERVER_PORT,
-        config::PLAYER_TOKEN
+        "{method} {path} HTTP/1.0\r\nHost: {server}:{}\r\n",
+        config::SERVER_PORT
     )
-    .is_ok()
-        && (body.is_empty()
-            || write!(
+    .is_ok();
+    if let Some(t) = token {
+        ok = ok && write!(req, "x-player-token: {t}\r\n").is_ok();
+    }
+    ok = ok && write!(req, "Connection: close\r\n").is_ok();
+    if !body.is_empty() {
+        ok = ok
+            && write!(
                 req,
                 "Content-Type: application/json\r\nContent-Length: {}\r\n",
                 body.len()
             )
-            .is_ok())
-        && write!(req, "\r\n{body}").is_ok();
+            .is_ok();
+    }
+    ok = ok && write!(req, "\r\n{body}").is_ok();
     if !ok {
         return Err(NetError::TooLarge);
     }
+
     socket
         .write_all(req.as_bytes())
         .await
@@ -286,17 +358,61 @@ async fn exchange<R>(
     parse(status, body)
 }
 
-fn game_path(suffix: &str) -> String<96> {
+fn game_path(game_id: &str, suffix: &str) -> String<96> {
     let mut p = String::new();
-    let _ = write!(p, "/api/games/{}{}", config::GAME_ID, suffix);
+    let _ = write!(p, "/api/games/{}{}", game_id, suffix);
     p
 }
 
-// polling loop to server
+// join + polling loop
 
-pub async fn poll_loop(stack: Stack<'static>, shared: &'static SharedGame) -> ! {
-    let path = game_path("");
+async fn ensure_joined(
+    stack: Stack<'static>,
+    shared: &'static SharedGame,
+    session: &'static SharedSession,
+) -> bool {
+    {
+        let s = session.lock().await;
+        if s.is_joined() {
+            return true;
+        }
+    }
 
+    let result = http(stack, "POST", "/api/games", "", None, read_join).await;
+    match result {
+        Ok(mut joined) => {
+            {
+                let mut s = session.lock().await;
+                s.game_id = joined.game_id.clone();
+                s.token = joined.token.clone();
+                s.joined = true;
+            }
+            if !joined.color.is_empty() {
+                assign(&mut joined.state.your_color, &joined.color);
+            }
+            let mut g = shared.lock().await;
+            g.set_link(Link::Online);
+            g.apply_server(&joined.state);
+            true
+        }
+        Err(e) => {
+            let mut g = shared.lock().await;
+            g.set_link(if matches!(&e, NetError::Server(_)) {
+                Link::ServerError
+            } else {
+                Link::Offline
+            });
+            g.set_message(e.message());
+            false
+        }
+    }
+}
+
+pub async fn poll_loop(
+    stack: Stack<'static>,
+    shared: &'static SharedGame,
+    session: &'static SharedSession,
+) -> ! {
     loop {
         if !stack.is_link_up() {
             shared.lock().await.set_link(Link::Wifi);
@@ -311,34 +427,45 @@ pub async fn poll_loop(stack: Stack<'static>, shared: &'static SharedGame) -> ! 
 
         let seq = {
             let mut g = shared.lock().await;
-            // IP is there, but no communication with server.
             if g.link == Link::Dhcp {
                 g.set_link(Link::Connecting);
             }
             g.move_seq
         };
-        let result = http(stack, "GET", &path, "", read_reply).await;
+
+        if !ensure_joined(stack, shared, session).await {
+            Timer::after(POLL_PERIOD).await;
+            continue;
+        }
+
+        let (game_id, token) = {
+            let s = session.lock().await;
+            (s.game_id.clone(), s.token.clone())
+        };
+        let poll_path = game_path(&game_id, "");
+        let result = http(stack, "GET", &poll_path, "", Some(&token), read_state).await;
 
         {
             let mut g = shared.lock().await;
-            // пока шёл poll, ушёл и принят ход: ответ устарел, ждём следующего
+            // While the poll was in flight a move was sent and accepted; the
+            // response is stale, so wait for the next poll.
             if g.move_seq == seq {
                 match result {
-                    Ok(Reply::State(s)) => {
+                    Ok(s) => {
                         let was = g.link;
                         g.set_link(Link::Online);
                         if was != Link::Online {
                             g.set_message("");
                         }
-                        g.apply(&s);
-                    }
-                    Ok(Reply::Error(m)) => {
-                        g.set_link(Link::ServerError);
-                        g.set_message(&m);
+                        g.apply_server(&s);
                     }
                     Err(e) => {
-                        g.set_link(Link::Offline);
-                        g.set_message(e.label());
+                        g.set_link(if matches!(&e, NetError::Server(_)) {
+                            Link::ServerError
+                        } else {
+                            Link::Offline
+                        });
+                        g.set_message(e.message());
                     }
                 }
             }
@@ -351,6 +478,7 @@ pub async fn poll_loop(stack: Stack<'static>, shared: &'static SharedGame) -> ! 
 pub async fn submit_move(
     stack: Stack<'static>,
     shared: &'static SharedGame,
+    session: &'static SharedSession,
     from: [u8; 2],
     to: [u8; 2],
     promotion: Option<char>,
@@ -376,17 +504,67 @@ pub async fn submit_move(
         return;
     }
 
-    let path = game_path("/moves");
-    let result = http(stack, "POST", &path, &body, read_reply).await;
+    let (game_id, token) = {
+        let s = session.lock().await;
+        (s.game_id.clone(), s.token.clone())
+    };
+    if game_id.is_empty() {
+        shared.lock().await.set_message("Not connected");
+        return;
+    }
+
+    let path = game_path(&game_id, "/moves");
+    let result = http(stack, "POST", &path, &body, Some(&token), read_state).await;
 
     let mut g = shared.lock().await;
     match result {
-        Ok(Reply::State(s)) => {
+        Ok(s) => {
             g.move_seq = g.move_seq.wrapping_add(1);
-            g.apply(&s);
+            g.apply_server(&s);
             g.set_message("Move accepted");
         }
-        Ok(Reply::Error(m)) => g.set_message(&m),
-        Err(e) => g.set_message(e.label()),
+        Err(e) => {
+            g.set_link(if matches!(&e, NetError::Server(_)) {
+                Link::ServerError
+            } else {
+                Link::Offline
+            });
+            g.set_message(e.message());
+        }
+    }
+}
+
+// embassy task entry points
+
+#[embassy_executor::task]
+pub async fn network_task(
+    stack: Stack<'static>,
+    shared: &'static SharedGame,
+    session: &'static SharedSession,
+) -> ! {
+    poll_loop(stack, shared, session).await
+}
+
+#[embassy_executor::task]
+pub async fn submit_move_task(
+    stack: Stack<'static>,
+    shared: &'static SharedGame,
+    session: &'static SharedSession,
+    from: [u8; 2],
+    to: [u8; 2],
+    promotion: Option<char>,
+) {
+    submit_move(stack, shared, session, from, to, promotion).await;
+}
+
+/// Spawns the chess polling task exactly once across the app lifetime.
+pub fn spawn_network_task(
+    spawner: Spawner,
+    stack: Stack<'static>,
+    shared: &'static SharedGame,
+    session: &'static SharedSession,
+) {
+    if !NETWORK_SPAWNED.swap(true, Ordering::SeqCst) {
+        spawner.spawn(network_task(stack, shared, session).expect("spawn chess network task"));
     }
 }

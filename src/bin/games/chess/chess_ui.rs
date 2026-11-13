@@ -38,16 +38,3 @@ pub fn is_promotion_move(fen: &str, from_file: usize, from_row: usize, to_row: u
     let piece = grid[from_row][from_file];
     (piece == b'P' && to_row == 0) || (piece == b'p' && to_row == 7)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // #[test]
-    // fn decodes_initial_position() {
-    //     let grid = fen_to_grid("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-    //     assert_eq!(grid[0][0], b'r');
-    //     assert_eq!(grid[7][4], b'K');
-    //     assert_eq!(grid[4][4], b' ');
-    // }
-}

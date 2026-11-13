@@ -70,6 +70,8 @@ tinybmp = "0.6.0"
 
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde-json-core = "0.6"
+embedded-sdmmc = "0.10.0"
+wasmi = "2.0.0"
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

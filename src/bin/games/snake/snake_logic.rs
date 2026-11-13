@@ -19,7 +19,6 @@ pub struct SnakeGame {
     over: bool,
     score: u16,
     seed: u32,
-    revision: u32,
 }
 
 impl SnakeGame {
@@ -37,7 +36,6 @@ impl SnakeGame {
             over: false,
             score: 0,
             seed: 0x51A7_2026,
-            revision: 0,
         }
     }
 
@@ -46,7 +44,6 @@ impl SnakeGame {
         *self = Self::new();
         self.seed = seed;
         self.place_food();
-        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Возвращает true, если направление принято (не разворот и игра не окончена).
@@ -80,7 +77,6 @@ impl SnakeGame {
             Direction::Right if x + 1 < WIDTH => (x + 1, y),
             _ => {
                 self.over = true;
-                self.revision = self.revision.wrapping_add(1);
                 return;
             }
         };
@@ -94,14 +90,12 @@ impl SnakeGame {
         };
         if self.body[..collision_len].contains(&next) {
             self.over = true;
-            self.revision = self.revision.wrapping_add(1);
             return;
         }
 
         if eating {
             if self.len >= MAX_LEN {
                 self.over = true;
-                self.revision = self.revision.wrapping_add(1);
                 return;
             }
             self.len += 1;
@@ -115,7 +109,6 @@ impl SnakeGame {
         if eating {
             self.place_food();
         }
-        self.revision = self.revision.wrapping_add(1);
     }
 
     fn place_food(&mut self) {
@@ -153,40 +146,4 @@ impl SnakeGame {
     pub fn is_over(&self) -> bool {
         self.over
     }
-
-    pub fn revision(&self) -> u32 {
-        self.revision
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    //     #[test]
-    //     fn snake_moves_forward_one_cell() {
-    //         let mut game = SnakeGame::new();
-    //         // Current head is (10,8) and direction is right; food is initially at (14,8).
-    //         game.tick();
-    //         assert_eq!(game.body()[0], (11, 8));
-    //         assert_eq!(game.body().len(), 3);
-    //     }
-    //
-    //     #[test]
-    //     fn snake_eats_food_and_grows() {
-    //         let mut game = SnakeGame::new();
-    //         for _ in 0..4 {
-    //             game.tick();
-    //         }
-    //         assert_eq!(game.body().len(), 4);
-    //         assert_eq!(game.score(), 1);
-    //     }
-    //
-    //     #[test]
-    //     fn reverse_direction_is_ignored() {
-    //         let mut game = SnakeGame::new();
-    //         game.set_direction(Direction::Left);
-    //         game.tick();
-    //         assert_eq!(game.body()[0], (11, 8));
-    //     }
 }

@@ -6,28 +6,20 @@
     holding buffers for the duration of a data transfer."
 )]
 
+mod game;
 mod games;
+mod input;
 mod utils;
 
 use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
-use esp_println as _;
+use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use esp_println::{self as _, print};
 
-use crate::games::chess::render_chess::ChessView;
-use crate::games::{
-    chess::{
-        chess_ui::{is_promotion_move, square_name},
-        render_chess::render_chess,
-    },
-    snake::{
-        render_snake::{SnakeView, render_snake},
-        snake_logic::{Direction, SnakeGame},
-    },
-};
+use crate::game::{Control, Game, GameContext, GameInstance, GameRegistry};
+use crate::input::{InputSampler, InputSnapshot, Navigation, RawInput, SharedInput};
 use crate::utils::config::*;
-use crate::utils::network::{GameState, Link, SharedGame};
-use crate::utils::{network, render_menu};
 use display_interface_spi::SPIInterface;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
 use embassy_sync::mutex::Mutex;
@@ -51,6 +43,8 @@ use esp_radio::wifi::{
 };
 use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 use static_cell::StaticCell;
+use utils::render_menu::{draw_menu_entry, init_menu};
+use utils::wifi_status;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -64,16 +58,35 @@ extern crate alloc;
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
+/// Code from https://github.com/rp-rs/rp-hal-boards/blob/main/boards/rp-pico/examples/pico_spi_sd_card.rs
+/// A dummy timesource, which is mostly important for creating files.
+#[derive(Default)]
+pub struct DummyTimesource();
+
+impl TimeSource for DummyTimesource {
+    // In theory you could use the RTC of the rp2040 here, if you had
+    // any external time synchronizing device.
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+            year_since_1970: 0,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AppMode {
+enum AppState {
     Menu,
-    Chess,
-    Snake,
+    InGame,
 }
 
 static NET_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
 static NET_STACK: StaticCell<Stack<'static>> = StaticCell::new();
-static SHARED_GAME: StaticCell<SharedGame> = StaticCell::new();
+static INPUT: StaticCell<SharedInput> = StaticCell::new();
 
 #[allow(
     clippy::large_stack_frames,
@@ -97,11 +110,6 @@ async fn wifi_watchdog(mut controller: WifiController<'static>) -> ! {
         }
         Timer::after(Duration::from_secs(5)).await;
     }
-}
-
-#[embassy_executor::task]
-async fn network_poll_task(stack: Stack<'static>, shared: &'static SharedGame) -> ! {
-    network::poll_loop(stack, shared).await
 }
 
 #[esp_rtos::main]
@@ -129,9 +137,7 @@ async fn main(spawner: Spawner) -> ! {
     .with_mosi(peripherals.GPIO25);
 
     let cs = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
-
     let dc = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
-
     let reset = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
 
     let spi_dev = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
@@ -142,10 +148,52 @@ async fn main(spawner: Spawner) -> ! {
         interface,
         reset,
         &mut Delay::new(),
-        Orientation::Landscape,
+        Orientation::LandscapeFlipped,
         DisplaySize240x320,
     )
     .expect("ILI9341 init failed");
+
+    // spi - sd card
+    let sd_spi = Spi::new(
+        peripherals.SPI3,
+        Config::default()
+            .with_frequency(Rate::from_khz(400))
+            .with_mode(Mode::_0),
+    )
+    .unwrap()
+    .with_sck(peripherals.GPIO14)
+    .with_mosi(peripherals.GPIO19)
+    .with_miso(peripherals.GPIO32);
+
+    let sd_cs = Output::new(peripherals.GPIO26, Level::High, OutputConfig::default());
+
+    let spi_dev = ExclusiveDevice::new(sd_spi, sd_cs, Delay::new()).unwrap();
+    let sd_card = SdCard::new(spi_dev, Delay::new());
+
+    let volume_mgr = VolumeManager::new(sd_card, DummyTimesource::default());
+
+    let volume0 = match volume_mgr.open_volume(VolumeIdx(0)) {
+        Ok(volume) => volume,
+        Err(e) => {
+            error!("Error: {:?}", defmt::Debug2Format(&e));
+            panic!("bad");
+        }
+    };
+    let root_dir = volume0.open_root_dir().unwrap();
+
+    let my_file = root_dir
+        .open_file_in_dir("FERRIS.TXT", embedded_sdmmc::Mode::ReadOnly)
+        .unwrap();
+
+    while !my_file.is_eof() {
+        let mut buffer = [0u8; 32];
+
+        if let Ok(n) = my_file.read(&mut buffer) {
+            for b in &buffer[..n] {
+                print!("{}", *b as char);
+            }
+        }
+    }
 
     // wifi
     let rng = Rng::new();
@@ -175,16 +223,14 @@ async fn main(spawner: Spawner) -> ! {
 
     let resources = NET_RESOURCES.init(StackResources::new());
     let (stack, runner) = embassy_net::new(wifi_interface, config, resources, net_seed);
-
-    let shared = SHARED_GAME.init(Mutex::new(GameState::new()));
     let stack = NET_STACK.init(stack);
 
-    // net task
+    // Shared game state must exist before any game (or its network task) is built.
+    let (chess_shared, chess_session) = games::chess::network::init_shared();
+
     spawner.spawn(net_task(runner).expect("spawn net task"));
     // task that tries to connect to internet using ssid and password
     spawner.spawn(wifi_watchdog(wifi_controller).expect("spawn Wi-Fi task"));
-    // task that polls a server
-    spawner.spawn(network_poll_task(*stack, shared).expect("spawn network task"));
 
     // joystick
     let mut adc_config = AdcConfig::new();
@@ -206,272 +252,102 @@ async fn main(spawner: Spawner) -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
 
-    // initial settup
-    let mut mode = AppMode::Menu;
+    // Shared peripheral snapshot, updated every frame.
+    let input_shared = INPUT.init(Mutex::new(InputSnapshot::empty()));
+    let mut input_sampler = InputSampler::new();
+
+    // Resources games receive while running.
+    let cx = GameContext {
+        spawner,
+        stack,
+        chess_shared,
+        chess_session,
+    };
+
+    // Register the games that are built into the firmware.
+    let mut registry = GameRegistry::new();
+    games::catalog(&mut registry);
+
+    let mut app_state = AppState::Menu;
+    let mut active: Option<GameInstance> = None;
     let mut menu_index = 0usize;
-    let mut snake = SnakeGame::new();
-    let mut snake_view = SnakeView::new();
-    let mut chess_view = ChessView::new();
-    let mut snake_tick = 0u8;
-    let mut cursor = (4usize, 6usize);
-    let mut selected: Option<(usize, usize)> = None;
-    let mut promotion_index = 0usize;
-    let mut prev_up = false;
-    let mut prev_down = false;
-    let mut prev_left = false;
-    let mut prev_right = false;
-    let mut prev_select = false;
-    let mut prev_back = false;
-    let mut prev_menu = false;
-    let mut navigation_repeat_ticks = 0u8;
-    let mut last_revision = u64::MAX;
-    let mut last_generation = u32::MAX;
-    let mut last_link = Link::Wifi;
-    let mut last_mode = AppMode::Chess;
+    let mut nav = Navigation::new();
+    let mut menu_needs_init = true;
     let mut last_menu_index = usize::MAX;
-    let mut last_snake_revision = u32::MAX;
-    let mut last_cursor = (usize::MAX, usize::MAX);
-    let mut last_selected: Option<(usize, usize)> = None;
-    let mut last_message = heapless::String::<48>::new();
-    let mut last_status = heapless::String::<16>::new();
+    let mut last_wifi_status = heapless::String::<28>::new();
 
     loop {
-        // Classic ESP32 ADC is 12-bit on ADC1. Dead zone avoids cursor drift.
-        let x = nb::block!(adc1.read_oneshot(&mut joy_x)).unwrap_or(2048);
-        let y = nb::block!(adc1.read_oneshot(&mut joy_y)).unwrap_or(2048);
-        let now_up = y < 850;
-        let now_down = y > 3200;
-        let now_left = x < 850;
-        let now_right = x > 3200;
-        let now_select = select.is_low();
-        let now_back = back.is_low();
-        let now_menu = menu.is_low();
-
-        let navigation_edge = (now_up && !prev_up)
-            || (now_down && !prev_down)
-            || (now_left && !prev_left)
-            || (now_right && !prev_right);
-        let navigation_held = now_up || now_down || now_left || now_right;
-        // Menu/chess cursor: move immediately on edge, then repeat every ~225 ms.
-        let move_now = if navigation_edge {
-            navigation_repeat_ticks = 0;
-            true
-        } else if navigation_held {
-            navigation_repeat_ticks = navigation_repeat_ticks.saturating_add(1);
-            if navigation_repeat_ticks >= 5 {
-                navigation_repeat_ticks = 0;
-                true
-            } else {
-                false
-            }
-        } else {
-            navigation_repeat_ticks = 0;
-            false
+        // 1. Read raw hardware and publish one interpreted input frame.
+        let raw = RawInput {
+            joy_x: nb::block!(adc1.read_oneshot(&mut joy_x)).unwrap_or(2048),
+            joy_y: nb::block!(adc1.read_oneshot(&mut joy_y)).unwrap_or(2048),
+            select: select.is_low(),
+            back: back.is_low(),
+            menu: menu.is_low(),
         };
+        let input = input_sampler.sample(raw);
+        *input_shared.lock().await = input;
 
-        match mode {
-            AppMode::Menu => {
-                if move_now {
-                    if now_up {
+        // 2. State machine: menu or the active game.
+        match app_state {
+            AppState::Menu => {
+                if nav.movement(&input) {
+                    if input.up {
                         menu_index = menu_index.saturating_sub(1);
                     }
-                    if now_down {
-                        menu_index = (menu_index + 1).min(1);
+                    if input.down {
+                        menu_index = (menu_index + 1).min(registry.len().saturating_sub(1));
                     }
                 }
-                if now_select && !prev_select {
-                    selected = None;
-                    if menu_index == 0 {
-                        chess_view.invalidate();
-                        mode = AppMode::Chess;
+
+                if input.press_select
+                    && let Some(entry) = registry.get(menu_index)
+                {
+                    let mut game: GameInstance = (entry.ctor)(cx);
+                    game.init();
+                    game.spawn_network(&cx);
+                    active = Some(game);
+                    app_state = AppState::InGame;
+                    continue;
+                }
+
+                let status = wifi_status(stack);
+                if menu_needs_init
+                    || menu_index != last_menu_index
+                    || status != last_wifi_status.as_str()
+                {
+                    if menu_needs_init {
+                        init_menu(&mut display, registry.entries(), menu_index, status);
                     } else {
-                        snake.reset();
-                        snake_tick = 0;
-                        snake_view.invalidate();
-                        mode = AppMode::Snake;
+                        draw_menu_entry(&mut display, registry.entries(), menu_index, status);
                     }
+                    menu_needs_init = false;
+                    last_menu_index = menu_index;
+                    last_wifi_status.clear();
+                    let _ = last_wifi_status.push_str(status);
                 }
             }
-            AppMode::Chess => {
-                if move_now {
-                    if now_up {
-                        cursor.1 = cursor.1.saturating_sub(1);
-                    }
-                    if now_down {
-                        cursor.1 = (cursor.1 + 1).min(7);
-                    }
-                    if now_left {
-                        cursor.0 = cursor.0.saturating_sub(1);
-                    }
-                    if now_right {
-                        cursor.0 = (cursor.0 + 1).min(7);
-                    }
-                }
-                if now_back && !prev_back {
-                    if selected.is_some() {
-                        selected = None;
-                        let mut s = shared.lock().await;
-                        s.message.clear();
-                        let _ = s.message.push_str("Selection cancelled");
-                    } else {
-                        mode = AppMode::Menu;
-                        menu_index = 0;
-                    }
-                }
-                if now_menu && !prev_menu {
-                    promotion_index = (promotion_index + 1) % 4;
-                    let mut s = shared.lock().await;
-                    s.message.clear();
-                    let _ = s.message.push_str("Promotion choice changed");
-                }
-                if now_select && !prev_select {
-                    if let Some((from_file, from_row)) = selected {
-                        if (from_file, from_row) == cursor {
-                            selected = None;
-                        } else {
-                            let snap = shared.lock().await.clone();
-                            let from = square_name(from_file, from_row);
-                            let to = square_name(cursor.0, cursor.1);
-                            let promotion = if is_promotion_move(
-                                snap.fen.as_str(),
-                                from_file,
-                                from_row,
-                                cursor.1,
-                            ) {
-                                Some(match promotion_index % 4 {
-                                    0 => 'q',
-                                    1 => 'r',
-                                    2 => 'b',
-                                    _ => 'n',
-                                })
-                            } else {
-                                None
-                            };
-                            network::submit_move(*stack, shared, from, to, promotion).await;
-                            selected = None;
-                        }
-                    } else {
-                        selected = Some(cursor);
-                    }
-                }
-            }
-            AppMode::Snake => {
-                const DEAD: i32 = 1000;
-                let dx = x as i32 - 2048;
-                let dy = y as i32 - 2048;
-
-                let horiz = if dx > DEAD {
-                    Some(Direction::Right)
-                } else if dx < -DEAD {
-                    Some(Direction::Left)
-                } else {
-                    None
-                };
-                let vert = if dy > DEAD {
-                    Some(Direction::Down)
-                } else if dy < -DEAD {
-                    Some(Direction::Up)
-                } else {
-                    None
+            AppState::InGame => {
+                let Some(game) = active.as_mut() else {
+                    app_state = AppState::Menu;
+                    menu_needs_init = true;
+                    continue;
                 };
 
-                let (primary, secondary) = if dx.abs() >= dy.abs() {
-                    (horiz, vert)
-                } else {
-                    (vert, horiz)
-                };
-
-                if let Some(d) = primary {
-                    if !snake.set_direction(d) {
-                        // Главная ось - разворот, пробуем вторую.
-                        if let Some(d2) = secondary {
-                            snake.set_direction(d2);
-                        }
+                match game.update(&input, &cx).await {
+                    Control::ExitToMenu => {
+                        active = None;
+                        app_state = AppState::Menu;
+                        menu_needs_init = true;
+                        continue;
                     }
+                    Control::Continue => {}
                 }
 
-                if now_back && !prev_back {
-                    mode = AppMode::Menu;
-                    menu_index = 1;
-                }
-                if now_select && !prev_select && snake.is_over() {
-                    snake.reset();
-                    snake_tick = 0;
-                    snake_view.invalidate();
-                }
-                if !snake.is_over() {
-                    snake_tick = snake_tick.saturating_add(1);
-                    if snake_tick >= 6 {
-                        snake_tick = 0;
-                        snake.tick();
-                    }
-                }
+                game.render(&mut display).await;
             }
         }
 
-        prev_up = now_up;
-        prev_down = now_down;
-        prev_left = now_left;
-        prev_right = now_right;
-        prev_select = now_select;
-        prev_back = now_back;
-        prev_menu = now_menu;
-
-        let snapshot = shared.lock().await.clone();
-        // `generation` grows on every change, including link changes that leave the game
-        // revision untouched - without it the link text on screen goes stale.
-        if last_generation != snapshot.generation
-            || last_revision != snapshot.revision
-            || last_mode != mode
-            || last_menu_index != menu_index
-            || (mode == AppMode::Snake && last_snake_revision != snake.revision())
-            || last_cursor != cursor
-            || last_selected != selected
-            || last_message != snapshot.message
-            || last_status != snapshot.status
-        {
-            match mode {
-                AppMode::Menu => {
-                    if last_mode != AppMode::Menu {
-                        render_menu::init_menu(&mut display, snapshot.status_text());
-                        render_menu::draw_menu_entry(
-                            &mut display,
-                            menu_index,
-                            snapshot.status_text(),
-                        );
-                    } else if menu_index != last_menu_index || last_link != snapshot.link {
-                        render_menu::draw_menu_entry(
-                            &mut display,
-                            menu_index,
-                            snapshot.status_text(),
-                        );
-                    }
-                }
-                AppMode::Chess => {
-                    render_chess(
-                        &mut display,
-                        &snapshot,
-                        cursor,
-                        selected,
-                        promotion_index,
-                        &mut chess_view,
-                    );
-                }
-                AppMode::Snake => {
-                    render_snake(&mut display, &snake, &mut snake_view);
-                }
-            }
-            last_generation = snapshot.generation;
-            last_revision = snapshot.revision;
-            last_link = snapshot.link;
-            last_mode = mode;
-            last_menu_index = menu_index;
-            last_snake_revision = snake.revision();
-            last_cursor = cursor;
-            last_selected = selected;
-            last_message = snapshot.message.clone();
-            last_status = snapshot.status.clone();
-        }
         Timer::after(Duration::from_millis(45)).await;
     }
 }

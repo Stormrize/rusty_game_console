@@ -3,15 +3,16 @@ use core::fmt::Write as _;
 use embedded_graphics::{
     Drawable, Pixel,
     draw_target::DrawTarget,
-    geometry::{Point, Size},
+    geometry::{Dimensions, Point, Size},
     mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
     pixelcolor::{Rgb565, RgbColor},
     primitives::{Primitive, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment},
     text::{Baseline, Text},
 };
+
 use tinybmp::Bmp;
 
-use crate::{games::chess::chess_ui::fen_to_grid, utils::network::GameState};
+use crate::games::chess::{chess_ui::fen_to_grid, network::GameState};
 
 const CELL: i32 = 24;
 const BOARD_X: i32 = 16;
@@ -254,18 +255,18 @@ fn draw_square<D>(
         // changes chess figure background color to square background collor
         // it is needed as tinybmp does not support alpha channel
         // it is a little bit slow for embdedded, change library
+        let image = &figures[i];
         let offset = Point::new(x + 2, y + 2);
 
-        let modified_pixels = figures[i].pixels().map(|Pixel(point, color)| {
-            let new_color = if color == Rgb565::WHITE { base } else { color };
+        let area = Rectangle::new(offset, image.bounding_box().size);
 
-            Pixel(point + offset, new_color)
-        });
+        let pixels = image.pixels().map(
+            |Pixel(_, color)| {
+                if color == Rgb565::WHITE { base } else { color }
+            },
+        );
 
-        let _ = d.draw_iter(modified_pixels);
-
-        #[cfg(false)]
-        let _ = Image::new(&figures[i], Point::new(x + 2, y + 2)).draw(d);
+        let _ = d.fill_contiguous(&area, pixels);
     }
 
     match (is_selected, is_cursor) {
