@@ -36,9 +36,8 @@ The chess networking system uses a dedicated server developed as a separate proj
 Development is still ongoing. Current priorities include:
 
 - Further optimizing memory usage and rendering performance.
-- Developing additional games.
+- Adding more games and porting them to WASM, and execute them with wasmi interpretor
 - Implementing an SD card-based storage system with a filesystem.
-- Creating a system for loading and running games dynamically instead of relying on games being statically compiled into the firmware.
 - Soldering all together
 
 ## Project Goal
