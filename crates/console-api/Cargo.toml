@@ -1,0 +1,7 @@
+[package]
+name = "console-api"
+version = "0.1.0"
+edition = "2024"
+description = "Host API shared between the Rusty Game Console firmware and its WASM games"
+
+[dependencies]

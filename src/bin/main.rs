@@ -7,8 +7,9 @@
 )]
 
 mod game;
-mod games;
+mod host;
 mod input;
+mod loader;
 mod utils;
 
 use defmt::{error, info};
@@ -17,12 +18,13 @@ use embassy_time::{Duration, Timer};
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use esp_println::{self as _, print};
 
-use crate::game::{Control, Game, GameContext, GameInstance, GameRegistry};
-use crate::input::{InputSampler, InputSnapshot, Navigation, RawInput, SharedInput};
+use crate::game::{GameMeta, MAX_GAMES};
+use crate::host::Host;
+use crate::input::{InputSampler, Navigation, RawInput};
+// wifi settings add yours
 use crate::utils::config::*;
 use display_interface_spi::SPIInterface;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
-use embassy_sync::mutex::Mutex;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{
     analog::adc::{Adc, AdcConfig, Attenuation},
@@ -64,8 +66,6 @@ esp_bootloader_esp_idf::esp_app_desc!();
 pub struct DummyTimesource();
 
 impl TimeSource for DummyTimesource {
-    // In theory you could use the RTC of the rp2040 here, if you had
-    // any external time synchronizing device.
     fn get_timestamp(&self) -> Timestamp {
         Timestamp {
             year_since_1970: 0,
@@ -86,7 +86,6 @@ enum AppState {
 
 static NET_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
 static NET_STACK: StaticCell<Stack<'static>> = StaticCell::new();
-static INPUT: StaticCell<SharedInput> = StaticCell::new();
 
 #[allow(
     clippy::large_stack_frames,
@@ -181,20 +180,6 @@ async fn main(spawner: Spawner) -> ! {
     };
     let root_dir = volume0.open_root_dir().unwrap();
 
-    let my_file = root_dir
-        .open_file_in_dir("FERRIS.TXT", embedded_sdmmc::Mode::ReadOnly)
-        .unwrap();
-
-    while !my_file.is_eof() {
-        let mut buffer = [0u8; 32];
-
-        if let Ok(n) = my_file.read(&mut buffer) {
-            for b in &buffer[..n] {
-                print!("{}", *b as char);
-            }
-        }
-    }
-
     // wifi
     let rng = Rng::new();
     let net_seed = rng.random() as u64 | ((rng.random() as u64) << 32);
@@ -225,12 +210,13 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(wifi_interface, config, resources, net_seed);
     let stack = NET_STACK.init(stack);
 
-    // Shared game state must exist before any game (or its network task) is built.
-    let (chess_shared, chess_session) = games::chess::network::init_shared();
+    // Host-side chess network state must exist before the host is built.
+    let (chess_shared, chess_session) = host::chess_net::init_shared();
 
     spawner.spawn(net_task(runner).expect("spawn net task"));
     // task that tries to connect to internet using ssid and password
     spawner.spawn(wifi_watchdog(wifi_controller).expect("spawn Wi-Fi task"));
+    host::chess_net::spawn_network_task(spawner, *stack, chess_shared, chess_session);
 
     // joystick
     let mut adc_config = AdcConfig::new();
@@ -253,23 +239,39 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     // Shared peripheral snapshot, updated every frame.
-    let input_shared = INPUT.init(Mutex::new(InputSnapshot::empty()));
+    let input_shared = input::init_shared();
     let mut input_sampler = InputSampler::new();
 
-    // Resources games receive while running.
-    let cx = GameContext {
+    // The WASM host owns the engine/store and implements the game ABI.
+    //
+    let mut wasm = Host::new(
+        &mut display,
+        &*input_shared,
         spawner,
-        stack,
+        *stack,
         chess_shared,
         chess_session,
-    };
+    )
+    .expect("wasm host init");
 
-    // Register the games that are built into the firmware.
-    let mut registry = GameRegistry::new();
-    games::catalog(&mut registry);
+    // Discover games on the SD card, load each module, and build the menu.
+    let discovered = loader::discover(&root_dir).expect("sd discover");
+
+    let mut metas: heapless::Vec<GameMeta, MAX_GAMES> = heapless::Vec::new();
+    let mut games: heapless::Vec<host::LoadedGame, MAX_GAMES> = heapless::Vec::new();
+
+    for entry in discovered {
+        let meta = entry.meta;
+        let game = wasm
+            .load(entry.wasm.as_slice(), meta.clone())
+            .expect("load wasm");
+        print!("loaded game: {}\n", meta.id);
+        let _ = metas.push(meta);
+        let _ = games.push(game);
+    }
 
     let mut app_state = AppState::Menu;
-    let mut active: Option<GameInstance> = None;
+    let mut active_index: Option<usize> = None;
     let mut menu_index = 0usize;
     let mut nav = Navigation::new();
     let mut menu_needs_init = true;
@@ -286,7 +288,8 @@ async fn main(spawner: Spawner) -> ! {
             menu: menu.is_low(),
         };
         let input = input_sampler.sample(raw);
-        *input_shared.lock().await = input;
+        input_shared.lock(|cell| cell.set(input));
+        host::bump_tick();
 
         // 2. State machine: menu or the active game.
         match app_state {
@@ -296,17 +299,13 @@ async fn main(spawner: Spawner) -> ! {
                         menu_index = menu_index.saturating_sub(1);
                     }
                     if input.down {
-                        menu_index = (menu_index + 1).min(registry.len().saturating_sub(1));
+                        menu_index = (menu_index + 1).min(metas.len().saturating_sub(1));
                     }
                 }
 
-                if input.press_select
-                    && let Some(entry) = registry.get(menu_index)
-                {
-                    let mut game: GameInstance = (entry.ctor)(cx);
-                    game.init();
-                    game.spawn_network(&cx);
-                    active = Some(game);
+                if input.press_select && menu_index < games.len() {
+                    wasm.init(&games[menu_index].game).expect("game init");
+                    active_index = Some(menu_index);
                     app_state = AppState::InGame;
                     continue;
                 }
@@ -317,9 +316,9 @@ async fn main(spawner: Spawner) -> ! {
                     || status != last_wifi_status.as_str()
                 {
                     if menu_needs_init {
-                        init_menu(&mut display, registry.entries(), menu_index, status);
+                        init_menu(&mut display, metas.as_slice(), menu_index, status);
                     } else {
-                        draw_menu_entry(&mut display, registry.entries(), menu_index, status);
+                        draw_menu_entry(&mut display, metas.as_slice(), menu_index, status);
                     }
                     menu_needs_init = false;
                     last_menu_index = menu_index;
@@ -328,23 +327,24 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
             AppState::InGame => {
-                let Some(game) = active.as_mut() else {
+                let Some(index) = active_index else {
                     app_state = AppState::Menu;
                     menu_needs_init = true;
                     continue;
                 };
 
-                match game.update(&input, &cx).await {
-                    Control::ExitToMenu => {
-                        active = None;
+                let game = &games[index].game;
+                match wasm.update(game).expect("game update") {
+                    crate::game::Control::ExitToMenu => {
+                        active_index = None;
                         app_state = AppState::Menu;
                         menu_needs_init = true;
                         continue;
                     }
-                    Control::Continue => {}
+                    crate::game::Control::Continue => {}
                 }
 
-                game.render(&mut display).await;
+                wasm.render(game).expect("game render");
             }
         }
 

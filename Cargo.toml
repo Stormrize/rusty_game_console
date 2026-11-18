@@ -62,6 +62,7 @@ heapless = { version = "0.9.3", features = ["serde"] }
 critical-section = "1.2.0"
 static_cell = "2.1.1"
 display-interface-spi = "0.5.0"
+display-interface = "0.5.0"
 embedded-hal-bus = "0.3.0"
 ili9341 = "0.6.0"
 embedded-graphics = "0.8.2"
@@ -71,7 +72,8 @@ tinybmp = "0.6.0"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde-json-core = "0.6"
 embedded-sdmmc = "0.10.0"
-wasmi = "2.0.0"
+wasmi = { version = "2.0.0", default-features = false, features = ["validate"] }
+console-api = { path = "crates/console-api" }
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

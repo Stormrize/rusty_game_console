@@ -1,11 +1,24 @@
 //! Peripheral input: raw hardware reads are interpreted here into a shared,
 //! copyable `InputSnapshot`. The app loop updates the shared snapshot once per
-//! frame; games receive the same frame without touching GPIO/ADC themselves.
+//! frame; both the menu and the WASM host read the same frame without touching
+//! GPIO/ADC themselves.
 
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
+use core::cell::Cell;
 
-/// Shared peripheral state. Everyone may read it; the app loop updates it.
-pub type SharedInput = Mutex<NoopRawMutex, InputSnapshot>;
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use static_cell::StaticCell;
+
+/// Shared peripheral state. Written by the app loop, read by the menu and host.
+pub type SharedInput = Mutex<CriticalSectionRawMutex, Cell<InputSnapshot>>;
+
+/// The single shared input slot, initialized once by `main`.
+pub static INPUT: StaticCell<SharedInput> = StaticCell::new();
+
+/// Initializes the shared input slot and returns a handle to it.
+pub fn init_shared() -> &'static mut SharedInput {
+    INPUT.init(Mutex::new(Cell::new(InputSnapshot::empty())))
+}
 
 /// Values read directly from hardware. `select/back/menu` are already debounced
 /// to "pressed" (active-low inputs are inverted by the caller).

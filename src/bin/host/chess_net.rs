@@ -1,3 +1,10 @@
+//! Host-side chess network service.
+//!
+//! Networking is a host concern: a WASM game cannot block on `async` embassy
+//! I/O, so the console keeps the chess join/poll/submit logic here and exposes
+//! the resulting state to the WASM chess game through the `chess_*` host
+//! functions. The WASM game only reads state and submits moves.
+
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -9,8 +16,12 @@ use embedded_io_async::Write as _;
 use heapless::String;
 use serde::Deserialize;
 use static_cell::StaticCell;
+use wasmi::{Caller, Error, Linker};
 
 use crate::utils::config;
+use console_api;
+
+use super::{HostState, write_guest};
 
 pub type SharedGame = Mutex<NoopRawMutex, GameState>;
 pub type SharedSession = Mutex<NoopRawMutex, Session>;
@@ -24,7 +35,7 @@ const POLL_PERIOD: Duration = Duration::from_secs(1);
 const RESP_MAX: usize = 1536;
 
 /// Initializes the chess shared state and returns shared handles to it. Called
-/// once by the app before any chess game is built or its network task spawns.
+/// once by the app before the host (or its network task) is built.
 pub fn init_shared() -> (&'static SharedGame, &'static SharedSession) {
     let game: &'static SharedGame = SHARED_GAME.init(Mutex::new(GameState::new()));
     let session: &'static SharedSession = SHARED_SESSION.init(Mutex::new(Session::new()));
@@ -131,7 +142,6 @@ impl GameState {
         changed |= assign(&mut self.status, &s.status);
         changed |= assign(&mut self.last_move, s.last_move.as_deref().unwrap_or(""));
         if self.revision != s.revision {
-            // A new move arrived; a stale notification is no longer relevant.
             self.revision = s.revision;
             assign(&mut self.message, "");
             changed = true;
@@ -142,7 +152,6 @@ impl GameState {
     }
 }
 
-/// Writes `src` into `dst` (truncated to capacity). Returns true on change.
 fn assign<const N: usize>(dst: &mut String<N>, src: &str) -> bool {
     let old = dst.clone();
     dst.clear();
@@ -154,7 +163,7 @@ fn assign<const N: usize>(dst: &mut String<N>, src: &str) -> bool {
     *dst != old
 }
 
-// session (connection identity, discovered from the server)
+// session
 
 pub struct Session {
     game_id: String<32>,
@@ -341,7 +350,7 @@ async fn exchange<R>(
         match socket.read(&mut raw[used..]).await {
             Ok(0) => break,
             Ok(n) => used += n,
-            Err(_) if used > 0 => break, // RST after reply
+            Err(_) if used > 0 => break,
             Err(_) => return Err(NetError::Io),
         }
     }
@@ -447,8 +456,6 @@ pub async fn poll_loop(
 
         {
             let mut g = shared.lock().await;
-            // While the poll was in flight a move was sent and accepted; the
-            // response is stale, so wait for the next poll.
             if g.move_seq == seq {
                 match result {
                     Ok(s) => {
@@ -557,7 +564,6 @@ pub async fn submit_move_task(
     submit_move(stack, shared, session, from, to, promotion).await;
 }
 
-/// Spawns the chess polling task exactly once across the app lifetime.
 pub fn spawn_network_task(
     spawner: Spawner,
     stack: Stack<'static>,
@@ -567,4 +573,108 @@ pub fn spawn_network_task(
     if !NETWORK_SPAWNED.swap(true, Ordering::SeqCst) {
         spawner.spawn(network_task(stack, shared, session).expect("spawn chess network task"));
     }
+}
+
+// Host functions exposed to the WASM chess game
+
+pub fn register(linker: &mut Linker<HostState>) -> Result<(), Error> {
+    linker.func_wrap(console_api::MODULE, "chess_fen", chess_fen)?;
+    linker.func_wrap(console_api::MODULE, "chess_turn", chess_turn)?;
+    linker.func_wrap(console_api::MODULE, "chess_your_color", chess_your_color)?;
+    linker.func_wrap(console_api::MODULE, "chess_status", chess_status)?;
+    linker.func_wrap(console_api::MODULE, "chess_last_move", chess_last_move)?;
+    linker.func_wrap(console_api::MODULE, "chess_bar", chess_bar)?;
+    linker.func_wrap(console_api::MODULE, "chess_submit_move", chess_submit_move)?;
+    Ok(())
+}
+
+fn snapshot(game: &'static SharedGame) -> GameState {
+    game.try_lock()
+        .map(|guard| (*guard).clone())
+        .unwrap_or_else(|_| GameState::new())
+}
+
+fn write_str(caller: &mut Caller<'_, HostState>, ptr: i32, max: i32, text: &str) -> i32 {
+    let n = text.len().min(max.max(0) as usize);
+    write_guest(caller, ptr, &text.as_bytes()[..n]) as i32
+}
+
+fn chess_fen(mut caller: Caller<'_, HostState>, ptr: i32, max: i32) -> i32 {
+    let state = snapshot(caller.data().chess_game);
+    write_str(&mut caller, ptr, max, state.fen.as_str())
+}
+
+fn chess_turn(caller: Caller<'_, HostState>) -> i32 {
+    match snapshot(caller.data().chess_game).turn.as_str() {
+        "white" => 0,
+        "black" => 1,
+        _ => -1,
+    }
+}
+
+fn chess_your_color(caller: Caller<'_, HostState>) -> i32 {
+    match snapshot(caller.data().chess_game).your_color.as_str() {
+        "white" => 0,
+        "black" => 1,
+        _ => -1,
+    }
+}
+
+fn chess_status(mut caller: Caller<'_, HostState>, ptr: i32, max: i32) -> i32 {
+    let state = snapshot(caller.data().chess_game);
+    write_str(&mut caller, ptr, max, state.status_text())
+}
+
+fn chess_last_move(mut caller: Caller<'_, HostState>, ptr: i32, max: i32) -> i32 {
+    let state = snapshot(caller.data().chess_game);
+    write_str(&mut caller, ptr, max, state.last_move.as_str())
+}
+
+fn chess_bar(mut caller: Caller<'_, HostState>, ptr: i32, max: i32) -> i32 {
+    let state = snapshot(caller.data().chess_game);
+    write_str(&mut caller, ptr, max, state.bar_text())
+}
+
+fn chess_submit_move(
+    caller: Caller<'_, HostState>,
+    from_file: i32,
+    from_row: i32,
+    to_file: i32,
+    to_row: i32,
+    promo: i32,
+) -> i32 {
+    if !(0..8).contains(&from_file)
+        || !(0..8).contains(&from_row)
+        || !(0..8).contains(&to_file)
+        || !(0..8).contains(&to_row)
+    {
+        return -1;
+    }
+
+    let from = square_name(from_file as usize, from_row as usize);
+    let to = square_name(to_file as usize, to_row as usize);
+    let promotion = match promo {
+        0 => Some('q'),
+        1 => Some('r'),
+        2 => Some('b'),
+        3 => Some('n'),
+        _ => None,
+    };
+
+    let data = caller.data();
+    let (spawner, stack, game, session) = (
+        data.spawner,
+        data.stack,
+        data.chess_game,
+        data.chess_session,
+    );
+
+    let _ = spawner.spawn(
+        submit_move_task(stack, game, session, from, to, promotion).expect("spawn chess move task"),
+    );
+    0
+}
+
+fn square_name(file: usize, row: usize) -> [u8; 2] {
+    [b'a' + file.min(7) as u8, b'8' - row.min(7) as u8]
 }

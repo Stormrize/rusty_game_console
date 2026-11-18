@@ -7,11 +7,11 @@ use embedded_graphics::{
     text::Text,
 };
 
-use crate::game::GameEntry;
+use crate::game::GameMeta;
 
 const BG: Rgb565 = Rgb565::new(2, 4, 8);
 
-pub fn init_menu<D>(display: &mut D, entries: &[GameEntry], selected: usize, network_status: &str)
+pub fn init_menu<D>(display: &mut D, entries: &[GameMeta], selected: usize, network_status: &str)
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -32,7 +32,7 @@ where
 
 pub fn draw_menu_entry<D>(
     display: &mut D,
-    entries: &[GameEntry],
+    entries: &[GameMeta],
     selected: usize,
     network_status: &str,
 ) where
@@ -73,7 +73,7 @@ pub fn draw_menu_entry<D>(
         if selected_row {
             let _ = Text::new(">", Point::new(92, y), text_style).draw(display);
         }
-        let _ = Text::new(entry.meta.title, Point::new(104, y), text_style).draw(display);
+        let _ = Text::new(entry.title.as_str(), Point::new(104, y), text_style).draw(display);
     }
 
     let mut network = heapless::String::<28>::new();
